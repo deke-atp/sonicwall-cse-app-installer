@@ -83,7 +83,7 @@ With the default `$INSTALLER_TYPE = "msi"` the MSI writes `mdm-config.json` and 
 - Device with any existing install (3.x or 4.x): cleanup and upgrade in place, existing registration kept, no new device record. Set `$FORCE_RESTAGE = $true` to override.
 - Device already clean at the target version: exits 0 after making sure services and firewall rules are in place.
 
-So the same Ninja script with the client's invite code and deployment key can target both an "old version" group and a "not installed" group. The invite code and deployment key are per client org. Either pass them as script parameters per org, or set `$NINJA_INVITE_CODE_FIELD` and `$NINJA_DEPLOYMENT_KEY_FIELD` to custom field names and the script reads them with `Ninja-Property-Get` when the parameters are blank.
+So the same Ninja script with the client's invite code and deployment key can target both an "old version" group and a "not installed" group. The invite code and deployment key are per client org. Either pass them as script parameters per org, or set `$NINJA_INVITE_CODE_FIELD` and `$NINJA_DEPLOYMENT_KEY_FIELD` to custom field names and the script reads them with `Ninja-Property-Get` when the parameters are blank. NinjaOne documents that cmdlet for device and global fields with script read access enabled; whether an organization-scoped field is readable from a device script should be tested in the tenant before relying on it. Treat the deployment key as a secret: use a secure custom field and give it script read access only.
 
 ### Linux
 
