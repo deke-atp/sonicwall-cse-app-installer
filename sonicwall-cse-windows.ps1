@@ -45,8 +45,11 @@ $ST_OVER_443 = $false
 # User Information for Device Certificate
 $MULTI_USER = $true
 
-# Preview Feature: Allow App via NetFirewallRule for Windows Firewall.
-$ALLOW_APP = $false
+# Pre-create Windows Firewall rules for the app so users never see the "Windows Security Alert"
+# prompt, which needs local admin to dismiss. The app opens a loopback-only listener when it starts;
+# without a program rule Windows asks the user to allow it. Rules are created as SYSTEM here
+# (inbound TCP+UDP for the app executable on all profiles, plus the vendor's outbound rule).
+$ALLOW_APP = $true
 
 # Installer type: "msi" or "exe"
 # SonicWall recommends the MSI for managed Windows devices on 4.3.0 and later. The MSI performs
@@ -60,6 +63,16 @@ $REMOVE_LEGACY = $true
 
 # Reinstall even when the device is already clean and at the target version.
 $FORCE_REINSTALL = $false
+
+# When an invite code and deployment key are given and the device already has a Banyan/CSE install,
+# the script upgrades in place and keeps the existing registration instead of staging a new device
+# record. Set this to $true to stage anyway.
+$FORCE_RESTAGE = $false
+
+# Optional NinjaOne custom fields to read the invite code and deployment key from when they are not
+# passed as parameters (lets one scheduled script serve every client org). Leave blank to disable.
+$NINJA_INVITE_CODE_FIELD = ""
+$NINJA_DEPLOYMENT_KEY_FIELD = ""
 
 # Require a valid SonicWall Authenticode signature on the downloaded installer.
 $VERIFY_SIGNATURE = $true
@@ -79,6 +92,15 @@ function Fail($msg) { Write-Host "ERROR: $msg"; exit 1 }
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (! $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Fail "This script must be run with admin privilege"
+}
+
+if ((!$INVITE_CODE -or !$DEPLOYMENT_KEY) -and $NINJA_INVITE_CODE_FIELD -and $NINJA_DEPLOYMENT_KEY_FIELD -and (Get-Command "Ninja-Property-Get" -ErrorAction SilentlyContinue)) {
+    Write-Host "Reading invite code and deployment key from NinjaOne custom fields"
+    try {
+        if (!$INVITE_CODE) { $INVITE_CODE = [string](Ninja-Property-Get $NINJA_INVITE_CODE_FIELD) }
+        if (!$DEPLOYMENT_KEY) { $DEPLOYMENT_KEY = [string](Ninja-Property-Get $NINJA_DEPLOYMENT_KEY_FIELD) }
+    } catch { Write-Host "Could not read NinjaOne custom fields: $($_.Exception.Message)" }
+    $INVITE_CODE = $INVITE_CODE.Trim(); $DEPLOYMENT_KEY = $DEPLOYMENT_KEY.Trim()
 }
 
 if (!$INVITE_CODE -or !$DEPLOYMENT_KEY) {
@@ -551,10 +573,11 @@ function install_msi($dl_file) {
     )
     $secret = @()
     if (-not $UPGRADE_FLOW) {
+        # INVITE_CODE makes the MSI write mdm-config.json; DEPLOYMENT_KEY additionally stages the device
         $props += "INVITE_CODE=`"$INVITE_CODE`""
         $props += "DEPLOY_USER=`"$MY_USER`""
         $props += "DEPLOY_EMAIL=`"$MY_EMAIL`""
-        $secret += "DEPLOYMENT_KEY=`"$DEPLOYMENT_KEY`""
+        if ($DO_STAGE) { $secret += "DEPLOYMENT_KEY=`"$DEPLOYMENT_KEY`"" }
     }
     $shown = "/i `"$dl_file`" /quiet /norestart $($props -join ' ') $(if ($secret) { 'DEPLOYMENT_KEY=*****' }) /l*v `"$log`""
     Log "Running: msiexec.exe $shown"
@@ -630,13 +653,32 @@ function start_app() {
 }
 
 function allow_app() {
-    if ($ALLOW_APP -and -not (Get-NetFirewallRule -DisplayName "SonicWall-CSE-App" -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule `
-            -DisplayName "SonicWall-CSE-App" `
-            -Program $CSE_EXE `
-            -Direction Outbound `
-            -Action Allow `
-            -Profile Public,Private,Domain | Out-Null
+    if (-not $ALLOW_APP) { return }
+    Log "Ensuring Windows Firewall rules for $CSE_EXE"
+    # Inbound program rule: this is what suppresses the Windows Security Alert prompt. Mirrors the
+    # rule Windows itself creates when a local admin clicks Allow (TCP and UDP, program-scoped).
+    foreach ($proto in @("TCP", "UDP")) {
+        $name = "SonicWall-CSE-App-Inbound-$proto"
+        if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -DisplayName $name -Description "Pre-created by the CSE installer script so users are not prompted" `
+                -Program $CSE_EXE -Direction Inbound -Protocol $proto -Action Allow -Profile Domain,Private,Public -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+    # Vendor's outbound rule (same name the MSI ALLOW_APP property uses)
+    if (-not (Get-NetFirewallRule -DisplayName "SonicWall-CSE-App" -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -DisplayName "SonicWall-CSE-App" -Program $CSE_EXE -Direction Outbound -Action Allow -Profile Domain,Private,Public -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+
+function remove_legacy_firewall_rules() {
+    # Rules Windows created for the old Banyan.exe when a user clicked Allow; the program is gone
+    $stale = Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue | Where-Object { $_.Program -match '\\(Banyan|CSE)\\(Banyan|CSE)\.exe$' }
+    foreach ($f in $stale) {
+        $rule = $f | Get-NetFirewallRule -ErrorAction SilentlyContinue
+        if ($rule) {
+            Log "Removing stale firewall rule '$($rule.DisplayName)' for $($f.Program)"
+            $rule | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -658,8 +700,9 @@ $alreadyClean = ($legacyCount -eq 0) -and ($orphans.Count -eq 0) -and ($entries.
     -and $current[0].Version -and ([version]$current[0].Version -eq $TARGET_VERSION) -and (Test-CseServicesHealthy)
 
 if ($alreadyClean -and -not $FORCE_REINSTALL) {
-    Log "Device is already clean and at $APP_VERSION ($INSTALLER_TYPE). Nothing to do."
+    Log "Device is already clean and at $APP_VERSION ($INSTALLER_TYPE). Nothing to install."
     Start-CseServices
+    if (-not $DRY_RUN) { allow_app; remove_legacy_firewall_rules }
     if (-not $UPGRADE_FLOW -and -not (Test-Path $CSE_CONFIG_FILE)) {
         Log "mdm-config.json missing; writing it"
         get_user_email
@@ -677,37 +720,53 @@ if ($REMOVE_LEGACY) {
     Log "WARNING: legacy installs present but REMOVE_LEGACY is false; the result will be a side-by-side install"
 }
 
+# Decide whether to stage (register a new device record with the deployment key).
+# Fresh device: stage. Device that already has any Banyan/CSE install: keep its registration.
+$DO_STAGE = $false
+if (-not $UPGRADE_FLOW) {
+    if ($entries.Count -eq 0 -and $orphans.Count -eq 0) {
+        $DO_STAGE = $true
+        Log "No existing install found: fresh zero-touch install with staging"
+    } elseif ($FORCE_RESTAGE) {
+        $DO_STAGE = $true
+        Log "FORCE_RESTAGE is set: the device will be staged again"
+    } else {
+        Log "Existing install found: upgrading in place and keeping the current registration (no re-staging)"
+    }
+}
+
 if ($DRY_RUN) {
-    Log "DRY RUN: would download $INSTALLER_URL and install $APP_VERSION via $INSTALLER_TYPE ($(if ($UPGRADE_FLOW) { 'upgrade flow, no re-staging' } else { 'zero-touch install flow with staging' }))"
-    if ($UPGRADE_FLOW -and -not (Test-Path $CSE_CONFIG_FILE)) {
+    Log "DRY RUN: would download $INSTALLER_URL and install $APP_VERSION via $INSTALLER_TYPE ($(if ($DO_STAGE) { 'with staging' } else { 'no re-staging' }))"
+    if (-not (Test-Path $CSE_CONFIG_FILE)) {
         foreach ($f in $LEGACY_CONFIG_FILES) { if (Test-Path $f) { Log "DRY RUN: would migrate mdm-config.json from $f" } }
     }
     exit 0
 }
 
-if ($UPGRADE_FLOW) {
-    migrate_legacy_config
-    $dl_file = download_installer
-    if ($INSTALLER_TYPE -eq "msi") { install_msi $dl_file } else { install_exe $dl_file }
-    verify_install
-    start_app
+migrate_legacy_config
+if (-not $UPGRADE_FLOW) { get_user_email }
+$dl_file = download_installer
+
+if ($INSTALLER_TYPE -eq "msi") {
+    # The MSI writes mdm-config.json (INVITE_CODE) and stages (DEPLOYMENT_KEY) from the properties passed
+    install_msi $dl_file
+    if (-not $UPGRADE_FLOW -and -not (Test-Path $CSE_CONFIG_FILE)) { create_config }
 } else {
-    get_user_email
-    $dl_file = download_installer
-    if ($INSTALLER_TYPE -eq "msi") {
-        # The MSI writes mdm-config.json and the deployment key itself from the properties passed
-        install_msi $dl_file
-        if (-not (Test-Path $CSE_CONFIG_FILE)) { create_config }
-    } else {
+    if ($DO_STAGE) {
         create_config
         install_exe $dl_file
         stage
         create_config
+    } else {
+        if (-not $UPGRADE_FLOW -and -not (Test-Path $CSE_CONFIG_FILE)) { create_config }
+        install_exe $dl_file
     }
-    verify_install
-    allow_app
-    start_app
 }
+
+verify_install
+allow_app
+remove_legacy_firewall_rules
+start_app
 
 Remove-Item -Path $dl_file -Force -ErrorAction SilentlyContinue
 Log "Done"

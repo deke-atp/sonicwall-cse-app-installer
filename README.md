@@ -47,6 +47,7 @@ Both the install flow and the upgrade flow on Windows and macOS now:
 4. Migrate an existing `mdm-config.json` from the legacy config directory (upgrade flow).
 5. Download the target installer, verify the signature, and install silently (MSI with properties, or EXE followed by staging).
 6. Verify the installed version, services and paths, start the services, and launch the app for the logged-on user.
+7. On Windows, pre-create firewall rules for the app executable (`$ALLOW_APP`, on by default in this fork). The app opens a loopback-only listener on start, and without a program rule Windows shows a "Windows Security Alert" that only a local admin can dismiss. Creating the inbound TCP and UDP program rules as SYSTEM removes that prompt. Stale rules left behind for the old `Banyan.exe` are removed.
 
 The scripts exit non-zero on any failure so the RMM job reports it.
 
@@ -75,6 +76,14 @@ Launch PowerShell as Administrator and run:
 ```
 
 With the default `$INSTALLER_TYPE = "msi"` the MSI writes `mdm-config.json` and stages the device from the properties passed to it. Set `$INSTALLER_TYPE = "exe"` to use the legacy EXE flow (the script also falls back to EXE automatically for target versions earlier than 4.3.0).
+
+**One script for fresh installs and upgrades.** On Windows the invite-code flow decides for itself whether to stage:
+
+- Device with no Banyan/CSE install: full zero-touch install, device staged with the deployment key.
+- Device with any existing install (3.x or 4.x): cleanup and upgrade in place, existing registration kept, no new device record. Set `$FORCE_RESTAGE = $true` to override.
+- Device already clean at the target version: exits 0 after making sure services and firewall rules are in place.
+
+So the same Ninja script with the client's invite code and deployment key can target both an "old version" group and a "not installed" group. The invite code and deployment key are per client org. Either pass them as script parameters per org, or set `$NINJA_INVITE_CODE_FIELD` and `$NINJA_DEPLOYMENT_KEY_FIELD` to custom field names and the script reads them with `Ninja-Property-Get` when the parameters are blank.
 
 ### Linux
 
@@ -127,7 +136,7 @@ On Windows, set `$NINJA_CUSTOM_FIELD` to a NinjaOne device custom field name to 
 
 ## NinjaOne rollout (Axios)
 
-1. Add `sonicwall-cse-windows.ps1` to the Ninja script library as a PowerShell script running as **System**, 64-bit. Preset parameters: `upgrade upgrade` (optionally followed by a pinned version such as `4.6.0`).
+1. Add `sonicwall-cse-windows.ps1` to the Ninja script library as a PowerShell script running as **System**, 64-bit. Preset parameters: either `upgrade upgrade` (upgrade-only, works for every org without credentials) or `<INVITE_CODE> <DEPLOYMENT_KEY>` per client org (also covers devices with no install). An optional third parameter pins a version such as `4.6.0`.
 2. Optionally add `sonicwall-cse-windows-inventory.ps1` and run it against all workstations first. Devices exiting 2 are the ones that need the upgrade.
 3. Pilot the upgrade on one or two 3.x devices and confirm: the app comes back, the user's org and registration carry over or the user can sign in once, and the inventory script then reports `clean-msi`.
 4. Run the upgrade script against the 3.x device group. Running it again later is harmless; devices already at the target version exit 0 without changes.
