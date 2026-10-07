@@ -83,7 +83,17 @@ With the default `$INSTALLER_TYPE = "msi"` the MSI writes `mdm-config.json` and 
 - Device with any existing install (3.x or 4.x): cleanup and upgrade in place, existing registration kept, no new device record. Set `$FORCE_RESTAGE = $true` to override.
 - Device already clean at the target version: exits 0 after making sure services and firewall rules are in place.
 
-So the same Ninja script with the client's invite code and deployment key can target both an "old version" group and a "not installed" group. The invite code and deployment key are per client org. Either pass them as script parameters per org, or set `$NINJA_INVITE_CODE_FIELD` and `$NINJA_DEPLOYMENT_KEY_FIELD` to custom field names and the script reads them with `Ninja-Property-Get` when the parameters are blank. NinjaOne documents that cmdlet for device and global fields with script read access enabled; whether an organization-scoped field is readable from a device script should be tested in the tenant before relying on it. Treat the deployment key as a secret: use a secure custom field and give it script read access only.
+So the same Ninja script with the client's invite code and deployment key can target both an "old version" group and a "not installed" group.
+
+**Running with no parameters under NinjaOne.** The invite code and deployment key are per client org. When the script runs with no parameters and `Ninja-Property-Get` is available, it reads the Axios organization custom fields and decides:
+
+| Org fields | Behaviour |
+|---|---|
+| `installSonicwallCse` checked, code and key present | Fresh installs allowed; existing installs upgraded in place |
+| Code and key present, checkbox not checked | Existing installs upgraded; devices with no CSE are left alone |
+| Code or key missing | Existing installs upgraded; devices with no CSE are left alone |
+
+Field names are set at the top of the script (`$NINJA_INSTALL_FLAG_FIELD`, `$NINJA_INVITE_CODE_FIELD`, `$NINJA_DEPLOYMENT_KEY_FIELD`). The fields need script read access in NinjaOne. Treat the deployment key as a secret: a secure custom field with script read access only is the right type for it.
 
 ### Linux
 
@@ -136,7 +146,7 @@ On Windows, set `$NINJA_CUSTOM_FIELD` to a NinjaOne device custom field name to 
 
 ## NinjaOne rollout (Axios)
 
-1. Add `sonicwall-cse-windows.ps1` to the Ninja script library as a PowerShell script running as **System**, 64-bit. Preset parameters: either `upgrade upgrade` (upgrade-only, works for every org without credentials) or `<INVITE_CODE> <DEPLOYMENT_KEY>` per client org (also covers devices with no install). An optional third parameter pins a version such as `4.6.0`.
+1. Add `sonicwall-cse-windows.ps1` to the Ninja script library as a PowerShell script running as **System**, 64-bit. With no parameters it reads the org custom fields (table above) and can safely target every Windows workstation. Alternatively pass `upgrade upgrade` (upgrade-only, no credentials) or `<INVITE_CODE> <DEPLOYMENT_KEY>` explicitly. A third parameter pins a version such as `4.6.0`; with no parameters the latest release is used.
 2. Optionally add `sonicwall-cse-windows-inventory.ps1` and run it against all workstations first. Devices exiting 2 are the ones that need the upgrade.
 3. Pilot the upgrade on one or two 3.x devices and confirm: the app comes back, the user's org and registration carry over or the user can sign in once, and the inventory script then reports `clean-msi`.
 4. Run the upgrade script against the 3.x device group. Running it again later is harmless; devices already at the target version exit 0 without changes.

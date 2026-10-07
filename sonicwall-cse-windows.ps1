@@ -69,10 +69,15 @@ $FORCE_REINSTALL = $false
 # record. Set this to $true to stage anyway.
 $FORCE_RESTAGE = $false
 
-# Optional NinjaOne custom fields to read the invite code and deployment key from when they are not
-# passed as parameters (lets one scheduled script serve every client org). Leave blank to disable.
-$NINJA_INVITE_CODE_FIELD = ""
-$NINJA_DEPLOYMENT_KEY_FIELD = ""
+# NinjaOne organization custom fields, used when the script runs with no parameters. This lets one
+# scheduled script serve every client org:
+#   - checkbox "Install SonicWall CSE" true  -> fresh installs allowed (needs code and key)
+#   - checkbox false or unset                -> existing installs are upgraded, nothing new is installed
+#   - code and key missing                   -> existing installs are upgraded, nothing new is installed
+# Leave blank to disable.
+$NINJA_INSTALL_FLAG_FIELD = "installSonicwallCse"
+$NINJA_INVITE_CODE_FIELD = "sonicwallCseRegistrationCode"
+$NINJA_DEPLOYMENT_KEY_FIELD = "sonicwallcsedeploymentkey"
 
 # Require a valid SonicWall Authenticode signature on the downloaded installer.
 $VERIFY_SIGNATURE = $true
@@ -94,13 +99,30 @@ if (! $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Admini
     Fail "This script must be run with admin privilege"
 }
 
+# No parameters and running under NinjaOne: drive the decision from the org custom fields
+$NO_FRESH_INSTALL = $false
 if ((!$INVITE_CODE -or !$DEPLOYMENT_KEY) -and $NINJA_INVITE_CODE_FIELD -and $NINJA_DEPLOYMENT_KEY_FIELD -and (Get-Command "Ninja-Property-Get" -ErrorAction SilentlyContinue)) {
-    Write-Host "Reading invite code and deployment key from NinjaOne custom fields"
+    Write-Host "Reading NinjaOne custom fields"
+    $ninja_flag = ""
     try {
-        if (!$INVITE_CODE) { $INVITE_CODE = [string](Ninja-Property-Get $NINJA_INVITE_CODE_FIELD) }
-        if (!$DEPLOYMENT_KEY) { $DEPLOYMENT_KEY = [string](Ninja-Property-Get $NINJA_DEPLOYMENT_KEY_FIELD) }
+        if (!$INVITE_CODE) { $INVITE_CODE = ([string](Ninja-Property-Get $NINJA_INVITE_CODE_FIELD 2>$null)).Trim() }
+        if (!$DEPLOYMENT_KEY) { $DEPLOYMENT_KEY = ([string](Ninja-Property-Get $NINJA_DEPLOYMENT_KEY_FIELD 2>$null)).Trim() }
+        if ($NINJA_INSTALL_FLAG_FIELD) { $ninja_flag = ([string](Ninja-Property-Get $NINJA_INSTALL_FLAG_FIELD 2>$null)).Trim() }
     } catch { Write-Host "Could not read NinjaOne custom fields: $($_.Exception.Message)" }
-    $INVITE_CODE = $INVITE_CODE.Trim(); $DEPLOYMENT_KEY = $DEPLOYMENT_KEY.Trim()
+
+    $install_allowed = ($ninja_flag -match '^(1|true|yes|on)$')
+    Write-Host "Org fields: install flag='$ninja_flag', invite code $(if ($INVITE_CODE) { 'present' } else { 'missing' }), deployment key $(if ($DEPLOYMENT_KEY) { 'present' } else { 'missing' })"
+
+    if ($INVITE_CODE -and $DEPLOYMENT_KEY -and $install_allowed) {
+        Write-Host "Org is flagged for CSE: fresh installs allowed"
+    } elseif ($INVITE_CODE -and $DEPLOYMENT_KEY) {
+        Write-Host "Org has CSE credentials but the install flag is not set: existing installs will be upgraded, nothing new installed"
+        $NO_FRESH_INSTALL = $true
+    } else {
+        Write-Host "Org has no CSE credentials: existing installs will be upgraded, nothing new installed"
+        $INVITE_CODE = "upgrade"; $DEPLOYMENT_KEY = "upgrade"
+        $NO_FRESH_INSTALL = $true
+    }
 }
 
 if (!$INVITE_CODE -or !$DEPLOYMENT_KEY) {
@@ -692,6 +714,11 @@ $orphans = @(Get-OrphanInstallDirs $entries)
 Log "Existing installs found: $($entries.Count)"
 foreach ($e in $entries) { Log "  - $($e.DisplayName) $($e.Version) [$($e.Kind), $($e.Scope)] $($e.InstallLocation)" }
 foreach ($d in $orphans) { Log "  - directory without registry entry: $d" }
+
+if ($NO_FRESH_INSTALL -and $entries.Count -eq 0 -and $orphans.Count -eq 0) {
+    Log "No CSE install on this device and the org is not flagged for new installs. Nothing to do."
+    exit 0
+}
 
 $legacyCount = @($entries | Where-Object { $_.Kind -eq "LegacyExe" }).Count
 $targetKind = if ($INSTALLER_TYPE -eq "msi") { "CseMsi" } else { "CseExe" }
